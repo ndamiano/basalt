@@ -104,6 +104,11 @@ def with_arg(args: list[str], flag: str, value) -> list[str]:
     out = list(args)
     if value is True:
         return out if flag in out else out + [flag]
+    if isinstance(value, list):                     # a flag with several values: --flag A B
+        if flag in out:
+            i = out.index(flag)
+            del out[i:i + 1 + len(value)]
+        return out + [flag, *map(str, value)]
     if flag in out:
         out[out.index(flag) + 1] = str(value)
     else:

@@ -118,6 +118,9 @@ def load_config_file(path: str, ap: argparse.ArgumentParser) -> tuple[list[str],
             raise ValueError(f'engine.{key}: a server option, set it under "server"')
         if isinstance(value, bool) or (isinstance(value, (str, int, float)) and str(value).strip() != ""):
             engine[flag] = value
+        elif (isinstance(value, list) and value
+              and all(isinstance(v, (str, int, float)) and not isinstance(v, bool) for v in value)):
+            engine[flag] = [str(v) for v in value]          # a flag with several values: --flag A B
         else:
             raise ValueError(f"engine.{key}: expected a string or number, or true/false for a switch, not {value!r}")
     return argv, engine
@@ -179,7 +182,8 @@ def engine_line(flags: dict, sources: dict, config: bool = True, shared: tuple[i
         if v is False:
             return f"no {f} ({sources[f]})"
         note = f"{sources[f]}: {shared[0]} / {shared[1]} slots" if shared and f == "--max-context" else sources[f]
-        return f"{f}{'' if v is True else f' {v}'} ({note})"
+        shown_v = " ".join(v) if isinstance(v, list) else v
+        return f"{f}{'' if v is True else f' {shown_v}'} ({note})"
     shown = ", ".join(one(f, v) for f, v in flags.items())
     if config:
         return f"[server] engine: {shown}" if shown else "[server] engine: config sets nothing, built-in defaults"
