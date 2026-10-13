@@ -333,6 +333,8 @@ public:
         return dropped;
     }
     size_t superseded() const { return superseded_; }
+    // the parked images, least recently active first (for writing them to a file)
+    const std::deque<SavedConversation>& entries() const { return entries_; }
 
     bool put(SavedConversation&& image, size_t held = 0) {
         const size_t n = image.bytes();

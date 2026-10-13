@@ -361,7 +361,7 @@ def make_handler(svc: Service):
                     if r is not None and (isinstance(r, bool) or not isinstance(r, int) or r < 0):
                         raise ValueError("reserve_mib: a whole number of MiB (0 or more), or null for the start's")
                     try:
-                        self._json(200, svc.vram(r))
+                        self._json(200, svc.vram(r, bool(req.get("restore_on_request"))))
                     except EngineDied as e:
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
