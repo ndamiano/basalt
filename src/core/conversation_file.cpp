@@ -29,7 +29,7 @@ struct Writer {
     template<class T> void pod(const T& v) { raw(&v, sizeof v); }
     void u64(uint64_t v) { pod(v); }
     void str(const std::string& s) { u64(s.size()); raw(s.data(), s.size()); }
-    template<class T> void vec(const std::vector<T>& v) { u64(v.size()); raw(v.data(), v.size() * sizeof(T)); }
+    template<class T, class A> void vec(const std::vector<T, A>& v) { u64(v.size()); raw(v.data(), v.size() * sizeof(T)); }
     void buf(const ConversationBuffer& b) {
         u64(b.size());
         if (!b.visit(0, b.size(), [&](const uint8_t* p, size_t n, size_t) { raw(p, n); return ok; })) ok = false;
@@ -52,7 +52,7 @@ struct Reader {
         return ok ? n : 0;
     }
     void str(std::string& s) { s.resize(count()); raw(s.data(), s.size()); }
-    template<class T> void vec(std::vector<T>& v) { v.resize(count()); raw(v.data(), v.size() * sizeof(T)); }
+    template<class T, class A> void vec(std::vector<T, A>& v) { v.resize(count()); raw(v.data(), v.size() * sizeof(T)); }
     void buf(ConversationBuffer& b) {
         b = {};
         b.resize(count());

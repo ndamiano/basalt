@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "basalt/core/conversation_snapshot.hpp"
 #include "basalt/kernels/kv_q4.hpp"
 #include <cuda_runtime.h>
@@ -137,6 +138,25 @@ void full_session(int fmt, int mode, int experts) {
     ConversationCheckpoint checkpoint;
     checkpoint.ids.assign(ids.begin(),ids.begin()+3);
     check(conversation_checkpoint_save(checkpoint,ss,g,err),"save complete running checkpoint");
+    {   // a deferred save equals the plain one, though the device state changes right after it is issued
+        ConversationCheckpointDeferral deferral;
+        check(deferral.reserve(sizes.gdn,err),"reserve the deferred checkpoint buffer");
+        ConversationCheckpoint deferred;
+        deferred.ids=checkpoint.ids;
+        check(deferral.save(deferred,ss,g,err) && deferral.pending()==deferred.gdn.data(),"issue deferred checkpoint save");
+        cuda_check(cudaMemset(ss.gdn_state,0x5a,sizes.gdn));
+        cuda_check(cudaDeviceSynchronize());
+        check(deferral.finish(err) && deferral.pending()==nullptr,"finish deferred checkpoint save");
+        check(deferred.gdn.size()==checkpoint.gdn.size() &&
+              std::equal(deferred.gdn.begin(),deferred.gdn.end(),checkpoint.gdn.begin()) &&
+              std::equal(deferred.ple.begin(),deferred.ple.end(),checkpoint.ple.begin()) &&
+              std::equal(deferred.tails.begin(),deferred.tails.end(),checkpoint.tails.begin()) &&
+              std::equal(deferred.dead.begin(),deferred.dead.end(),checkpoint.dead.begin()) &&
+              std::equal(deferred.block_pos.begin(),deferred.block_pos.end(),checkpoint.block_pos.begin()),
+              "deferred checkpoint bytes match the plain save");
+        cuda_check(cudaMemset(ss.gdn_state,13,sizes.gdn));
+        cuda_check(cudaDeviceSynchronize());
+    }
     checkpoint.used = 17;
     checkpoints.push_back(std::move(checkpoint));
     const ConversationView view{ids,images,checkpoints,true};
@@ -231,7 +251,7 @@ void full_session(int fmt, int mode, int experts) {
     check(conversation_checkpoint_restore(a.checkpoints[0],ss,g,err),"restore early running checkpoint");
     std::vector<uint8_t> spare(sizes.dead);
     cuda_check(cudaMemcpy(spare.data(),main.state.idx_pooled,sizes.dead,cudaMemcpyDeviceToHost));
-    check(spare==a.checkpoints[0].dead,"checkpoint rebuilds spare row over a later completed block");
+    check(std::equal(spare.begin(),spare.end(),a.checkpoints[0].dead.begin(),a.checkpoints[0].dead.end()),"checkpoint rebuilds spare row over a later completed block");
     check(ss.ple_prev[0]==2 && ss.ple_prev[1]==3,"checkpoint PLE token window");
 }
 }
