@@ -115,6 +115,8 @@ class ProcessEngine:
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
         self.log_path = log
+        # parked conversations kept across engine processes: written at close, read after READY (empty: off)
+        self.conversation_file = (env or os.environ).get("BASALT_CONVERSATION_FILE", "")
         self.proc, self.pump, self.log = None, None, None
         self.ended, self.unloaded = True, True
         self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
@@ -149,9 +151,13 @@ class ProcessEngine:
                 threading.Thread(target=echo_requests, args=(log, os.path.getsize(log)), daemon=True).start()
         sink = None if log else ProcessEngine.stderr_sink
         self.max_context = 0                            # before the new process is visible: never its predecessor's
+        # BASALT_CONVERSATION_FILE: the engine in its own session, so a supervisor's group-wide SIGTERM reaches only the
+        # server, which then saves the conversations and ends the engine in order.  The engine still ends with the
+        # server: it exits when its stdin closes.
+        own = bool(self.conversation_file) and os.name == "posix"
         self.proc = subprocess.Popen([engine_bin, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE if sink else self.log, text=True, encoding="utf-8",
-                                     bufsize=1, env=env)
+                                     bufsize=1, env=env, start_new_session=own)
         if sink:
             threading.Thread(target=pump_lines, args=(self.proc.stderr, sink), daemon=True).start()
         # the lines come from a thread up to READY, so the read can time out and the rest of the stream stays for _pump
@@ -239,6 +245,8 @@ class ProcessEngine:
         self.wlock = threading.Lock()                   # serializes stdin writes
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
+        if self.conversation_file and os.path.exists(self.conversation_file):
+            self.conversation_command("CONVLOAD")
 
     @staticmethod
     def _ready_pump(proc, out: queue.Queue) -> None:
@@ -1138,10 +1146,41 @@ class ProcessEngine:
             pass
         return EngineSilent(f"{what}; the server ended the engine")
 
+    CONVERSATION_FILE_S = 120.0
+
+    def conversation_command(self, verb: str) -> bool:
+        """CONVSAVE / CONVLOAD the conversation file between requests; prints the outcome, never raises."""
+        try:
+            with self.wlock:
+                self.proc.stdin.write(f"{verb} {self.conversation_file}\n")
+                self.proc.stdin.flush()
+            deadline = time.time() + self.CONVERSATION_FILE_S
+            while True:
+                line = self.lines.get(timeout=max(0.1, deadline - time.time()))
+                if line is None:
+                    print(f"[server] conversations: the engine ended during {verb}", flush=True)
+                    return False
+                line = line.strip()
+                if line.startswith("CONV "):
+                    print(f"[server] conversations: {line[5:]} ({self.conversation_file})", flush=True)
+                    return True
+                if line.startswith("ERR"):
+                    print(f"[server] conversations: {verb} refused: {line[4:].strip()}", flush=True)
+                    return False
+                if time.time() > deadline:
+                    raise queue.Empty
+        except queue.Empty:
+            print(f"[server] conversations: no answer to {verb}", flush=True)
+        except (OSError, ValueError, AttributeError) as e:
+            print(f"[server] conversations: {verb} failed ({e})", flush=True)
+        return False
+
     def close(self):
         """End the engine: QUIT, then terminate, then kill, 20 s each; EngineStuck if it still runs."""
         if self.proc is None:
             return
+        if self.conversation_file and self.alive():
+            self.conversation_command("CONVSAVE")
         try:
             if self.proc.poll() is None:
                 try:

@@ -12,6 +12,7 @@
 #include "basalt/core/draft_cum.hpp"
 #include "basalt/core/remote_expert_opt.hpp"
 #include "basalt/core/expert_cache.hpp"
+#include "basalt/core/conversation_file.hpp"
 #include "basalt/core/conversation_snapshot.hpp"
 #include "basalt/core/conversation_memory.hpp"
 #include "basalt/core/coupled_draft.hpp"
@@ -5234,6 +5235,37 @@ int main(int argc, char** argv) {
             }
             return true;
         };
+        // CONVSAVE <file>: park the live conversation and write every parked one to <file>; CONVLOAD <file>: put the
+        // conversations of such a file into the cache (each is validated when a request restores it, as usual).
+        // Between requests only.  Reply: CONV saved|loaded conversations=N bytes=B ms=T, or ERR <why>.
+        auto conv_file_command = [&](const std::string& line) {
+            const bool save = line.rfind("CONVSAVE ", 0) == 0;
+            const std::string path = line.substr(9);
+            auto reply_err = [&](const std::string& m) { std::printf("ERR %s\n", m.c_str()); std::fflush(stdout); };
+            if (!conversations.enabled()) { reply_err("CONV: the conversation cache is off (--conversation-cache-mib)"); return; }
+            if (path.empty()) { reply_err("expected: CONVSAVE <file> or CONVLOAD <file>"); return; }
+            basalt::core::ConversationFileIdentity id;
+            std::string ferr;
+            if (!basalt::core::conversation_file_identity(o.model, BASALT_VERSION, id, ferr)) { reply_err("CONV: " + ferr); return; }
+            const auto t0 = Clock::now();
+            size_t bytes = 0, n = 0;
+            if (save) {
+                if (!park_current(0)) { reply_err("CONV: parking the live conversation failed: " + err); err.clear(); return; }
+                std::vector<const basalt::core::SavedConversation*> images;
+                for (const auto& e : conversations.entries()) images.push_back(&e);
+                n = images.size();
+                if (!basalt::core::conversation_file_write(path, id, images, bytes, ferr)) { reply_err("CONV: " + ferr); return; }
+            } else {
+                std::vector<basalt::core::SavedConversation> images;
+                if (!basalt::core::conversation_file_read(path, id, images, bytes, ferr)) { reply_err("CONV: " + ferr); return; }
+                for (auto& s : images) n += conversations.put(std::move(s)) ? 1 : 0;
+            }
+            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+            std::fprintf(stderr, "basalt serve: conversation cache: %s %zu conversation%s, %zu MiB, in %.0f ms; parked=%zu\n",
+                         save ? "wrote" : "read", n, n == 1 ? "" : "s", bytes >> 20, ms, conversations.size());
+            std::printf("CONV %s conversations=%zu bytes=%zu ms=%.0f\n", save ? "saved" : "loaded", n, bytes, ms);
+            std::fflush(stdout);
+        };
         int64_t pp_total = 0, pp_from = 0, pp_next_check = 0;
         // the position the prompt pass has read up to (a chunk's or a window's end): what a request cancelled mid-read
         // reports as read, instead of the whole prompt
@@ -5961,10 +5993,13 @@ int main(int argc, char** argv) {
                 e = "VRAM needs an engine started with --vram-elastic (one NVIDIA GPU, --serve)";
                 return false;
             }
-            if (src.complement_ready()) {
-                e = "VRAM: not with the resident low-RAM mode (the cache holds experts RAM does not)";
-                return false;
-            }
+            // The resident low-RAM mode: the cache holds experts the RAM copy does not, so a shrink leaves the evicted
+            // ones on the mapped files only.  That stays correct (blob() reads an expert the copy lacks from the files)
+            // and the take-back below refills them from there - from the SSD, so it is slower than from RAM.  Between
+            // the two a request reads those experts from the files too; the server's restore_on_request avoids that.
+            if (src.complement_ready() && reserve > o.vram_reserve_mib)
+                std::fprintf(stderr, "basalt serve: VRAM: resident mode - the experts given up are read back from the "
+                                     "model file when the VRAM is taken back\n");
             if (peer.valid()) { e = "VRAM: not with --peer-device"; return false; }
             for (const PfPart& p : pf_parts)
                 if (!p.lent.empty()) { e = "VRAM: a prompt's loan is still out"; return false; }
@@ -6859,6 +6894,11 @@ int main(int argc, char** argv) {
             if (line.rfind("BYIELD", 0) == 0) continue;   // for a prompt read that has ended meanwhile
             if (line.rfind("ENC ", 0) == 0) {   // the in-engine image encoder, between requests and windows
                 enc_command(line);
+                continue;
+            }
+            if (line.rfind("CONVSAVE ", 0) == 0 || line.rfind("CONVLOAD ", 0) == 0) {   // between requests
+                if (batch_on()) { std::printf("ERR CONV: not while batch slots are decoding\n"); std::fflush(stdout); }
+                else conv_file_command(line);
                 continue;
             }
             if (line.rfind("VRAM", 0) == 0) {   // between requests, not a request

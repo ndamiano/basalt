@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import os
 import ctypes
 import subprocess
 import threading
@@ -166,7 +167,7 @@ class Service:
 
     vram_wait_s = 300.0                                  # POST /v1/vram wait for a running request
 
-    def vram(self, reserve_mib: int | None) -> dict:
+    def vram(self, reserve_mib: int | None, restore_on_request: bool = False) -> dict:
         """POST /v1/vram: keep `reserve_mib` of VRAM free (None: the starting reserve), applied between requests.
         Needs --vram-elastic; an unloaded engine applies it on load."""
         if not hasattr(self.engine, "vram"):
@@ -183,8 +184,12 @@ class Service:
                 self.vram_reserve = reserve_mib
                 return {"status": "not loaded", "reserve_mib": reserve_mib,
                         "note": "applied when the model loads"}
+            if reserve_mib is None:
+                self._wait_for_vram_back()
             out = self.engine.vram(reserve_mib)
             self.vram_reserve = reserve_mib
+            # lent until the next request: the request takes the VRAM back first (load() below)
+            self.vram_restore_pending = bool(restore_on_request) and reserve_mib is not None
             print(f"[server] vram: {out.get('vram_free_mib')} MiB free, expert cache {out.get('expert_cache_mib')} of "
                   f"{out.get('expert_cache_full_mib')} MiB ({out.get('expert_slots')} experts)", flush=True)
             return {"status": "ok", **out}
@@ -204,10 +209,57 @@ class Service:
         """Start the engine if unloaded (POST /load and every generation request); may raise GpuBusy."""
         # keeps the idle thread from unloading before this request starts
         self.last_request_at = time.time()
+        if getattr(self, "vram_restore_pending", False) and self.loaded():
+            self._vram_restore()
         if self.loaded() and not self._vision_down():
             return
         with self.fifo:
             self.ensure_loaded()
+
+    vram_back_wait_s = 15.0
+
+    def _wait_for_vram_back(self):
+        """Before taking VRAM back: wait (up to vram_back_wait_s) until enough is free to refill the whole expert
+        cache.  The program that borrowed it (ComfyUI's /free, say) answers before the driver has released it, and a
+        take-back that ran at once would grow only into what happened to be free."""
+        v = (getattr(self.engine, "info", {}) or {}).get("vram") or {}
+        full, cur = v.get("expert_cache_full_mib"), v.get("expert_cache_mib")
+        if not isinstance(full, int) or not isinstance(cur, int) or cur >= full:
+            return
+        # BASALT_VRAM_BACK_CMD: asks the borrower to let go first (e.g. curl ComfyUI's /free)
+        cmd = os.environ.get("BASALT_VRAM_BACK_CMD", "").strip()
+        if cmd:
+            try:
+                subprocess.run(cmd, shell=True, timeout=30, stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except (OSError, subprocess.SubprocessError) as e:
+                print(f"[server] warning: BASALT_VRAM_BACK_CMD failed ({e})", flush=True)
+        need = full - cur              # the cache's missing part (the grow itself keeps the reserve free)
+        deadline = time.time() + self.vram_back_wait_s
+        free = self.free_vram_mib()
+        while free is not None and free < need and time.time() < deadline:
+            time.sleep(0.1)
+            free = self.free_vram_mib()
+        if free is not None and free < need:
+            print(f"[server] vram: only {free} MiB free of the {need} the cache needs back; taking what is there",
+                  flush=True)
+
+    def _vram_restore(self):
+        """Take back VRAM lent with restore_on_request, before a request decodes with a shrunk expert cache."""
+        with self.fifo:
+            if not getattr(self, "vram_restore_pending", False):
+                return
+            self.vram_restore_pending = False
+            t = time.time()
+            try:
+                self._wait_for_vram_back()
+                out = self.engine.vram(None)
+                self.vram_reserve = None
+                print(f"[server] vram: taken back for the request in {time.time() - t:.1f} s, expert cache "
+                      f"{out.get('expert_cache_mib')} of {out.get('expert_cache_full_mib')} MiB", flush=True)
+            except (ValueError, EngineDied) as e:
+                print(f"[server] warning: taking the VRAM back failed ({e}); the request runs with what is there",
+                      flush=True)
 
     def unload(self, idle_for: float | None = None) -> str:
         """Stop the engine between requests: "unloaded", "not loaded", "busy" or "unsupported"."""
