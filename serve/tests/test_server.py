@@ -1088,6 +1088,34 @@ class GpuChoice(unittest.TestCase):
         finally:
             shutil.rmtree(v.dir, ignore_errors=True)
 
+    def test_engine_vision_keeps_every_image_of_a_request_past_the_cache_size(self):
+        # a conversation with more than 64 images: the new ones must not evict the request's
+        # older ones (KeyError -> dropped connection -> 502); used images are evicted last
+        from serve.engine.vision import EngineVision
+
+        class Eng:
+            def encode_images(self, jobs):
+                for _, out in jobs:
+                    out.write_bytes(b"sve")
+                return ["OK 7 2 2 5"] * len(jobs)
+
+        v = EngineVision({})
+        v.attach(Eng())
+        try:
+            with mock.patch.object(EngineVision, "load", side_effect=lambda s: s.encode()), \
+                    mock.patch.object(EngineVision, "normalize", side_effect=lambda d: d):
+                v.encode_many([f"old{i}" for i in range(60)])
+                big = [f"img{i}" for i in range(80)]
+                got = v.encode_many(big)
+                self.assertEqual(len(got), 80)
+                self.assertTrue(all(path.exists() for path, _ in got))
+                v.encode_many(big[:1])                                  # touched: now the newest
+                v.encode_many([f"new{i}" for i in range(30)])
+                self.assertIn(got[0][0].stem, v.cache)
+                self.assertEqual(len(v.cache), 64)
+        finally:
+            shutil.rmtree(v.dir, ignore_errors=True)
+
     def test_process_engine_enc_replies(self):
         import queue as q
         from serve.engine.process import ProcessEngine
