@@ -142,12 +142,13 @@ class Vision:
         im.save(out, format="PNG")
         return out.getvalue()
 
-    def encode(self, source: str) -> tuple[Path, int]:
-        """Return (embeddings file, image token count)."""
+    def encode(self, source: str, keep: frozenset = frozenset()) -> tuple[Path, int]:
+        """Return (embeddings file, image token count). `keep`: keys the caller still needs (never evicted)."""
         data = self.normalize(self.load(source))
         key = hashlib.sha256(data).hexdigest()[:32]
         with self.lock:
             if key in self.cache:
+                self.cache[key] = self.cache.pop(key)                  # recently used: evicted last
                 return self.cache[key]
             img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
             img.write_bytes(data)
@@ -158,7 +159,7 @@ class Vision:
             if not line.startswith("OK"):
                 raise ValueError("the image could not be read: " + (line[4:] if line.startswith("ERR") else
                                                                      "the vision encoder stopped"))
-            return self._remember(key, out, int(line.split()[1]))
+            return self._remember(key, out, int(line.split()[1]), keep)
 
     def _enc(self, img: Path, out: Path) -> str:
         """One ENC round trip with the sidecar: its `OK <n> ...` or `ERR ...` line."""
@@ -170,16 +171,21 @@ class Vision:
             self.stopped = True                         # alive() is False, so the next request starts it again
             raise ValueError(str(e)) from None
 
-    def _remember(self, key: str, out: Path, n: int) -> tuple[Path, int]:
+    def _remember(self, key: str, out: Path, n: int, keep=frozenset()) -> tuple[Path, int]:
+        """Cache an encoded image; least recently used go first past 64, except `keep` (the current request's
+        images: a conversation with more than 64 needs them all at once, so the cache grows for it)."""
         self.cache[key] = (out, n)
-        if len(self.cache) > 64:                                       # oldest first
-            old = next(iter(self.cache))
+        for old in [k for k in self.cache if k not in keep and k != key][:max(0, len(self.cache) - 64)]:
             self.cache.pop(old)[0].unlink(missing_ok=True)
         return self.cache[key]
 
     def encode_many(self, sources: list[str]) -> list[tuple[Path, int]]:
-        """`encode` for each image of a request, in order."""
-        return [self.encode(src) for src in sources]
+        """`encode` for each image of a request, in order; earlier ones stay cached while later ones encode."""
+        out, keys = [], set()
+        for src in sources:
+            out.append(self.encode(src, frozenset(keys)))
+            keys.add(out[-1][0].stem)
+        return out
 
     def close(self):
         try:
@@ -230,6 +236,9 @@ class EngineVision(Vision):
             keys.append(key)
             datas[key] = data
         with self.lock:
+            for k in dict.fromkeys(keys):                               # recently used: evicted last
+                if k in self.cache:
+                    self.cache[k] = self.cache.pop(k)
             todo = [k for k in dict.fromkeys(keys) if k not in self.cache]
             jobs = [(self.dir / f"{k}.img", self.dir / f"{k}.sve") for k in todo]
             try:
@@ -238,7 +247,7 @@ class EngineVision(Vision):
                 if jobs:
                     lines = self.engine.encode_images(jobs)
                     for k, (_, out), line in zip(todo, jobs, lines):
-                        self._remember(k, out, int(line.split()[1]))
+                        self._remember(k, out, int(line.split()[1]), frozenset(keys))
             finally:
                 for img, _ in jobs:
                     img.unlink(missing_ok=True)
