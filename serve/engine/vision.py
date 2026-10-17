@@ -20,7 +20,7 @@ from serve.engine.flags import flag_value
 # starts a fresh one.
 VISION_READY_S = 300.0
 VISION_ENCODE_S = 300.0
-VISION_CACHE_BYTES = 1 << 30                    # room for about 64 images
+VISION_CACHE_BYTES = 8 << 30                    # local: long Skyrim screenshot sessions
 
 
 class Vision:
