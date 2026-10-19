@@ -2899,7 +2899,10 @@ bool Verifier::capture_batch(int R, int hbase, std::string& err) {
     pdl_rec_ = pdl_try;
     row_base_ = hbase;
     std::string rerr;
+    const bool ar_save = ar_off_;
+    ar_off_ = true;
     const bool ok = record_window(R, cs_, rerr);
+    ar_off_ = ar_save;
     batch_rec_ = false;
     pdl_rec_ = false;
     row_base_ = 0;
